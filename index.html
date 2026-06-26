@@ -323,7 +323,7 @@ table.data-table input,table.data-table select{font-size:12.5px;padding:5px 7px;
 @keyframes slidein{from{opacity:0;transform:translateX(16px);}to{opacity:1;transform:translateX(0);}}
 
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:90;display:flex;align-items:center;justify-content:center;padding:20px;}
-.modal-box{background:#fff;border-radius:var(--radius);max-width:380px;width:100%;padding:24px;box-shadow:var(--shadow-lg);}
+.modal-box{background:#fff;border-radius:var(--radius);max-width:380px;width:100%;padding:24px;box-shadow:var(--shadow-lg);max-height:calc(100vh - 40px);overflow-y:auto;}
 .modal-box.wide{max-width:600px;}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 16px;margin-bottom:6px;}
 .form-grid.full{grid-column:1 / -1;}
@@ -588,6 +588,7 @@ table.data-table input,table.data-table select{font-size:12.5px;padding:5px 7px;
         <button class="btn btn-primary" id="loginSubmitBtn" style="width:100%;justify-content:center;">Login</button>
         <div class="auth-hint"><a href="#" id="forgotPasswordLink">Forgot Password?</a></div>
         <div class="auth-hint">Default password is your Employee ID.</div>
+        <div id="storageDiagBanner"></div>
       </div>
     </div>
   </div>
@@ -1067,6 +1068,20 @@ const MIN_PASSWORD_LENGTH = 8;
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const SESSION_WARNING_MS = 28 * 60 * 1000;
 
+/* ------------------------------------------------------------------
+   0b. PASSWORD NOTIFICATION WEBHOOK (Power Automate)
+   ------------------------------------------------------------------
+   This app has no backend, so cross-device email notifications must
+   go through an external relay. Point this at a Power Automate flow
+   with an "When an HTTP request is received" trigger that branches
+   on payload.eventType and sends an Outlook email accordingly.
+   Leave as "" to disable notifications entirely (no error will show
+   to users either way - this fails silently by design, see
+   sendNotificationWebhook()).
+   ------------------------------------------------------------------ */
+const PASSWORD_NOTIFY_WEBHOOK_URL = ""; // <-- paste Power Automate HTTP trigger URL here
+const ADMIN_NOTIFY_EMAIL = ""; // <-- e.g. "vilube-it-admin@motul.com" (used by the Flow, sent in payload for convenience)
+
 const STATUS = {
   NOT_STARTED: "Not Started",
   DRAFT: "Draft Saved",
@@ -1346,6 +1361,33 @@ function logAudit(userLabel, action){
 }
 function getAuditLog(){ try{ return JSON.parse(safeLsGet(LS_AUDIT) || "[]"); }catch(e){ return []; } }
 
+/* ------------------------------------------------------------------
+   2d. PASSWORD NOTIFICATION WEBHOOK
+   ------------------------------------------------------------------
+   Fire-and-forget POST to PASSWORD_NOTIFY_WEBHOOK_URL. Never throws,
+   never blocks the calling flow, and never shows an error to the
+   user - if the webhook is unset, unreachable, or the Flow itself
+   fails, the local action (password reset, audit log entry, etc.)
+   must still complete normally. This is a notification best-effort,
+   not a required step.
+   ------------------------------------------------------------------ */
+function sendNotificationWebhook(eventType, payload){
+  if (!PASSWORD_NOTIFY_WEBHOOK_URL) return; // notifications disabled
+  try{
+    const body = Object.assign({
+      eventType: eventType,
+      app: "Vilube Talent & Competency Portal",
+      adminNotifyEmail: ADMIN_NOTIFY_EMAIL,
+      timestamp: nowISO()
+    }, payload || {});
+    fetch(PASSWORD_NOTIFY_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).catch(function(){ /* swallow - notification is best-effort */ });
+  } catch(e){ /* swallow - never let a notification failure break the UI flow */ }
+}
+
 function getSession(){ try{ return JSON.parse(safeSsGet(SS_SESSION) || "null"); }catch(e){ return null; } }
 function saveSession(s){ safeSsSet(SS_SESSION, JSON.stringify(s)); }
 function clearSession(){ safeSsSet(SS_SESSION, ""); }
@@ -1392,6 +1434,77 @@ function safeSsGet(key){
 function safeSsSet(key, val){
   try{ sessionStorage.setItem(key, val); }
   catch(e){ _memSS[key] = val; }
+}
+
+/* ------------------------------------------------------------------
+   2c. STORAGE / DEPLOYMENT DIAGNOSTICS
+   ------------------------------------------------------------------
+   Root-cause context: this app has no server — every account, password,
+   submitted assessment and audit entry lives ONLY in this browser's
+   localStorage on this one device. That is fine for a single user on a
+   single device, but it produces two predictable symptoms in the field:
+
+   1) "Login fails on a colleague's machine" — expected by design. Each
+      device has its own empty localStorage, so it has never seen that
+      Employee ID before. (ensureAccountExists() will normally create a
+      fresh account there using the Employee ID as the temporary
+      password — if that ALSO fails, storage itself is blocked, see #2.)
+
+   2) "Asks to reset password every time I reopen" — NOT expected, and
+      usually means the browser is not actually persisting localStorage
+      across page loads for this file. The most common real-world cause
+      is the file being opened from a different temporary path each
+      time (e.g. double-clicking an email/Zalo/Teams attachment, which
+      many mail/chat clients extract to a new temp folder on every
+      open). Some browsers (notably Safari) scope file:// storage to the
+      exact path/URL, so a new temp path == a brand-new, empty storage
+      area == forced reset. Strict privacy settings (e.g. "block all
+      cookies and site data") can also silently prevent persistence.
+
+   This block does NOT fix #1 (that requires a real shared backend —
+   see Admin > Data Quality for a written explanation and options) but
+   it DOES detect and clearly surface #2 so the person hitting it knows
+   it's an environment issue, not something wrong with their account.
+   ------------------------------------------------------------------ */
+const LS_STORAGE_PROBE = "vilube_storage_probe_v1";
+let storageDiagnostics = { isFileProtocol:false, persistedAcrossReload:null, storageBlocked:false };
+
+function runStorageDiagnostics(){
+  storageDiagnostics.isFileProtocol = (window.location && window.location.protocol === "file:");
+
+  let previousProbe = null;
+  try{ previousProbe = localStorage.getItem(LS_STORAGE_PROBE); }
+  catch(e){ storageDiagnostics.storageBlocked = true; }
+
+  if (!storageDiagnostics.storageBlocked){
+    if (previousProbe){
+      storageDiagnostics.persistedAcrossReload = true;
+    } else {
+      let sameSessionRanBefore = false;
+      try{ sameSessionRanBefore = sessionStorage.getItem(LS_STORAGE_PROBE) === "1"; }catch(e){}
+      storageDiagnostics.persistedAcrossReload = sameSessionRanBefore ? false : null;
+    }
+    try{ localStorage.setItem(LS_STORAGE_PROBE, String(Date.now())); }catch(e){ storageDiagnostics.storageBlocked = true; }
+    try{ sessionStorage.setItem(LS_STORAGE_PROBE, "1"); }catch(e){}
+  }
+
+  renderStorageWarningBanner();
+}
+
+function renderStorageWarningBanner(){
+  const host = document.getElementById("storageDiagBanner");
+  if (!host) return;
+  const d = storageDiagnostics;
+  let msg = "";
+  if (d.storageBlocked){
+    msg = "Browser storage is blocked in this context. Logins, password changes and saved data will NOT persist - even within the same session. Check browser privacy settings (e.g. \"block all cookies/site data\") or open this file in a different browser.";
+  } else if (d.persistedAcrossReload === false){
+    msg = "This file does not appear to be loading from a stable location - login/password state is not persisting across reloads. This usually happens when the file is opened from a temporary path (e.g. an email or chat attachment that re-extracts to a new folder each time). Save the file to a fixed location (or host it on an internal web address) and open it from there.";
+  } else if (d.isFileProtocol){
+    msg = "This file is running directly from disk (file://). Each device/browser keeps its own separate copy of accounts and submitted data - logging in on one computer will not be visible on another. For consistent multi-device access, host this file at a stable internal web address.";
+  }
+  if (!msg){ host.innerHTML = ""; return; }
+  host.innerHTML = '<div class="auth-hint" style="background:#fff3cd;border:1px solid #ffe69c;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:12.5px;line-height:1.5;text-align:left;">⚠️ ' + escapeHtml(msg) + '</div>';
 }
 
 /* ------------------------------------------------------------------
@@ -2784,17 +2897,35 @@ function gradeOptionsHtml(selected){
   return opts;
 }
 
+const MANAGER_ESCALATION_VALUE = "Supply Chain Director";
+function managerOptionsHtml(selected, excludeEeCode){
+  let opts = '<option value="">— Leave blank to auto-infer —</option>';
+  opts += '<option value="' + escapeHtml(MANAGER_ESCALATION_VALUE) + '" ' + (selected===MANAGER_ESCALATION_VALUE?"selected":"") + '>' + escapeHtml(MANAGER_ESCALATION_VALUE) + ' (external — top of org, not an assessed employee)</option>';
+  const names = DB.employees
+    .filter(function(e){ return e.eeCode.toLowerCase() !== (excludeEeCode||"").toLowerCase(); })
+    .map(function(e){ return e.name; })
+    .sort(function(a,b){ return a.localeCompare(b); });
+  names.forEach(function(n){ opts += '<option value="' + escapeHtml(n) + '" ' + (n===selected?"selected":"") + '>' + escapeHtml(n) + '</option>'; });
+  // If the currently saved value doesn't match any valid option (e.g. legacy typo, renamed/removed employee),
+  // surface it instead of silently dropping it, so Admin notices and can correct it explicitly.
+  if (selected && selected !== MANAGER_ESCALATION_VALUE && names.indexOf(selected) === -1){
+    opts = '<option value="' + escapeHtml(selected) + '" selected>⚠️ ' + escapeHtml(selected) + ' (not found in current roster — please re-select)</option>' + opts;
+  }
+  return opts;
+}
+
 function openEmployeeModal(mode, sourceEeCode){
-  let data = { eeCode:"", name:"", jobTitle:"", grade:"", group:"", function:"", manager:"", note:"" };
+  let data = { eeCode:"", name:"", email:"", jobTitle:"", grade:"", group:"", function:"", manager:"", note:"" };
   let isNew = true;
   if (mode === "edit" || mode === "duplicate"){
     const src = getEmployee(sourceEeCode);
     if (!src){ toast("Employee not found.", "error"); return; }
-    data = { eeCode:src.eeCode, name:src.name, jobTitle:src.jobTitle||"", grade:src.grade||"", group:src.group||"", function:src.function||"", manager:src.manager||"", note:src.note||"" };
+    data = { eeCode:src.eeCode, name:src.name, email:src.email||"", jobTitle:src.jobTitle||"", grade:src.grade||"", group:src.group||"", function:src.function||"", manager:src.manager||"", note:src.note||"" };
     if (mode === "edit"){ isNew = false; }
     else { // duplicate
       data.eeCode = uniqueEeCode(src.eeCode + "-COPY");
       data.name = src.name + " (Copy)";
+      data.email = ""; // a duplicated employee must not inherit the source's email
       data.manager = src.manager || "";
       isNew = true;
     }
@@ -2810,11 +2941,12 @@ function openEmployeeModal(mode, sourceEeCode){
         '<div class="form-grid">' +
           '<div class="form-field"><label>EE Code *</label><input type="text" id="ef_eeCode" value="' + escapeHtml(data.eeCode) + '"><div class="field-err" id="ef_err_eeCode"></div></div>' +
           '<div class="form-field"><label>Name *</label><input type="text" id="ef_name" value="' + escapeHtml(data.name) + '"><div class="field-err" id="ef_err_name"></div></div>' +
+          '<div class="form-field"><label>Email</label><input type="email" id="ef_email" value="' + escapeHtml(data.email) + '" placeholder="name@motul.com"><div class="field-err" id="ef_err_email"></div><div class="text-muted" style="font-size:11px;margin-top:3px;">Used for password-reset notifications. Leave blank if unavailable, but Forgot Password notifications won\'t reach this employee.</div></div>' +
           '<div class="form-field"><label>Job Title</label><input type="text" id="ef_jobTitle" value="' + escapeHtml(data.jobTitle) + '"></div>' +
           '<div class="form-field"><label>Grade *</label><select id="ef_grade">' + gradeOptionsHtml(data.grade) + '</select><div class="field-err" id="ef_err_grade"></div></div>' +
           '<div class="form-field"><label>Group (A / B / C)</label><select id="ef_group"><option value="">— Infer from grade —</option><option value="A" ' + (data.group==="A"?"selected":"") + '>A</option><option value="B" ' + (data.group==="B"?"selected":"") + '>B</option><option value="C" ' + (data.group==="C"?"selected":"") + '>C</option></select><div class="field-err" id="ef_err_group"></div></div>' +
           '<div class="form-field"><label>Function *</label><input type="text" id="ef_function" list="ef_function_list" value="' + escapeHtml(data.function) + '"><datalist id="ef_function_list">' + employeeFunctionOptionsHtml(data.function) + '</datalist><div class="field-err" id="ef_err_function"></div></div>' +
-          '<div class="form-field"><label>Manager</label><input type="text" id="ef_manager" placeholder="Leave blank to auto-infer" value="' + escapeHtml(data.manager) + '"></div>' +
+          '<div class="form-field"><label>Manager</label><select id="ef_manager">' + managerOptionsHtml(data.manager, mode==="edit" ? sourceEeCode : null) + '</select><div class="text-muted" style="font-size:11px;margin-top:3px;">Choosing from this list (instead of free text) ensures Manager-role detection cannot silently break due to a typo.</div></div>' +
           '<div class="form-field" style="grid-column:1 / -1;"><label>Note</label><textarea id="ef_note" rows="2">' + escapeHtml(data.note) + '</textarea></div>' +
         '</div>' +
         '<div class="modal-err" id="ef_general_err"></div>' +
@@ -2832,6 +2964,7 @@ function openEmployeeModal(mode, sourceEeCode){
 function saveEmployeeFromModal(isNew, originalEeCode){
   const eeCodeRaw = document.getElementById("ef_eeCode").value.trim();
   const name = document.getElementById("ef_name").value.trim();
+  const email = document.getElementById("ef_email").value.trim();
   const jobTitle = document.getElementById("ef_jobTitle").value.trim();
   const grade = document.getElementById("ef_grade").value.trim();
   let group = document.getElementById("ef_group").value.trim();
@@ -2839,7 +2972,7 @@ function saveEmployeeFromModal(isNew, originalEeCode){
   const manager = document.getElementById("ef_manager").value.trim();
   const note = document.getElementById("ef_note").value.trim();
 
-  ["eeCode","name","grade","group","function"].forEach(function(f){ const el = document.getElementById("ef_err_"+f); if (el) el.textContent = ""; });
+  ["eeCode","name","email","grade","group","function"].forEach(function(f){ const el = document.getElementById("ef_err_"+f); if (el) el.textContent = ""; });
   document.getElementById("ef_general_err").textContent = "";
 
   let hasError = false;
@@ -2847,6 +2980,7 @@ function saveEmployeeFromModal(isNew, originalEeCode){
 
   if (!eeCodeRaw) setErr("eeCode", "EE Code is required.");
   if (!name) setErr("name", "Name is required.");
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) setErr("email", "Email format looks invalid.");
   if (!grade) setErr("grade", "Grade is required.");
   if (!fn) setErr("function", "Function is required.");
   if (group && ["A","B","C"].indexOf(group) === -1) setErr("group", "Group must be A, B or C.");
@@ -2861,7 +2995,7 @@ function saveEmployeeFromModal(isNew, originalEeCode){
 
   if (isNew){
     DB.employees.push({
-      eeCode: eeCodeRaw, name:name, email:"", jobTitle:jobTitle, jobLevel:"", grade:grade, group:group,
+      eeCode: eeCodeRaw, name:name, email:email, jobTitle:jobTitle, jobLevel:"", grade:grade, group:group,
       department:"", function:fn, manager: manager || null, managerSource: manager ? "Manually set by Admin" : null,
       anomalyCorrected:false, originalFunction:null, note:note
     });
@@ -2872,7 +3006,7 @@ function saveEmployeeFromModal(isNew, originalEeCode){
   } else {
     const emp = getEmployee(originalEeCode);
     const eeCodeChanged = originalEeCode && eeCodeRaw.toLowerCase() !== originalEeCode.toLowerCase();
-    emp.eeCode = eeCodeRaw; emp.name = name; emp.jobTitle = jobTitle; emp.grade = grade; emp.group = group;
+    emp.eeCode = eeCodeRaw; emp.name = name; emp.email = email; emp.jobTitle = jobTitle; emp.grade = grade; emp.group = group;
     emp.function = fn; emp.manager = manager || null; emp.managerSource = manager ? "Manually set by Admin" : null;
     emp.note = note;
     DB.employees = buildDbFromRaw({ employees: DB.employees.map(stripManagerIfBlank), competencies: DB.competencies, functionWeights: DB.functionWeightsFlat, bars: DB.bars, ratingScale: DB.ratingScale }, DB.sourceLabel).employees;
@@ -3055,6 +3189,28 @@ function renderAdminAssessments(){
 function renderAdminQuality(){
   const result = runDataQuality();
   let html = "";
+
+  // --- Deployment / storage health (root cause of cross-device login issues) ---
+  const d = storageDiagnostics;
+  const protoLabel = d.isFileProtocol ? "file:// (opened directly from disk)" : (window.location.protocol + "//" + window.location.host || "web server");
+  let persistLabel = "Inconclusive (first load in this browser, or probe not yet confirmed)";
+  let persistClass = "alert-info";
+  if (d.storageBlocked){ persistLabel = "BLOCKED — browser is not allowing storage at all"; persistClass = "alert-error"; }
+  else if (d.persistedAcrossReload === true){ persistLabel = "OK — storage is persisting normally on this device/browser"; persistClass = "alert-success"; }
+  else if (d.persistedAcrossReload === false){ persistLabel = "FAILING — storage is NOT surviving a reload on this device/browser"; persistClass = "alert-error"; }
+
+  html += '<div class="section-head" style="margin-top:0;"><div><h3>Deployment &amp; Storage Health</h3>' +
+    '<div class="desc">This app is fully client-side: there is no server, so every account, password and submitted assessment lives only in the browser\'s local storage on one device. Use this panel to confirm whether storage is behaving normally on the device you are checking.</div></div></div>';
+  html += '<div class="alert alert-info" style="margin-bottom:10px;"><span>ℹ️</span><div><strong>This device/browser</strong><ul>' +
+    '<li>Protocol: ' + escapeHtml(protoLabel) + '</li>' +
+    '<li>Storage persistence: <span style="font-weight:600;">' + escapeHtml(persistLabel) + '</span></li>' +
+    '</ul></div></div>';
+  html += '<div class="alert ' + persistClass + '" style="margin-bottom:14px;"><span>📌</span><div><strong>What this means</strong><ul>' +
+    '<li><b>"Can\'t login on a colleague\'s machine"</b> — expected by design with no backend: that machine has its own empty storage and has never seen that Employee ID. It should still auto-create an account there using the Employee ID as the temporary password; if that also fails, check the storage persistence result above on that machine.</li>' +
+    '<li><b>"Asks to reset password every time I reopen"</b> — usually NOT expected, and means storage on that device is not surviving a reload (commonly: the file is opened from a temporary path that changes every time, e.g. an email/chat attachment that re-extracts to a new folder on each open; or the browser is blocking storage outright). Save the file to one fixed location, or host it at a stable internal web address, then re-test the persistence check above.</li>' +
+    '<li><b>Submitted assessments / master data edits do not appear on another device</b> — also expected: this app has no shared backend. The Export to Excel buttons (Admin and per-employee) are currently the only way to consolidate data collected on different devices into one file.</li>' +
+    '</ul></div></div>';
+
   html += '<div class="kpi-card ' + (result.issues.length? "warn":"good") + '" style="margin-bottom:14px;display:inline-block;min-width:200px;">' +
     '<div class="label">Validation Issues</div><div class="value">' + result.issues.length + '</div>' +
     '<div class="sub">' + (result.issues.length ? "Requires attention" : "No blocking issues found") + '</div></div>';
@@ -3135,7 +3291,7 @@ function parseUploadedWorkbook(workbook){
     if (!fn) warnings.push("Employee " + eeCode + " is missing Function.");
     employees.push({
       eeCode: String(eeCode), name: String(name),
-      email: getField(r, ["Email","Work email"]) || "",
+      email: getField(r, ["Email","Work email","E-mail"]) || "",
       jobTitle: getField(r, ["Job title","Job Title"]) || "",
       jobLevel: getField(r, ["Job level","Job Level"]) || "",
       grade: grade || "", group: group || "",
@@ -3583,11 +3739,24 @@ async function attemptLogin(){
 
   document.getElementById("loginSubmitBtn").disabled = true;
   let account;
-  try{ account = await ensureAccountExists(idLower); }
-  finally{ document.getElementById("loginSubmitBtn").disabled = false; }
+  try{
+    account = await ensureAccountExists(idLower);
+  } catch(err){
+    document.getElementById("loginSubmitBtn").disabled = false;
+    errEl.textContent = "Could not create or read your account on this device/browser (" + (err && err.message ? err.message : "storage error") + "). See the notice below.";
+    renderStorageWarningBanner();
+    return;
+  }
+  document.getElementById("loginSubmitBtn").disabled = false;
   if (!account){ errEl.textContent = "Invalid Employee ID or password."; return; }
 
-  const hash = await hashPassword(pw, account.salt);
+  let hash;
+  try{
+    hash = await hashPassword(pw, account.salt);
+  } catch(err){
+    errEl.textContent = "Could not verify your password on this device (" + (err && err.message ? err.message : "crypto error") + ").";
+    return;
+  }
   if (hash !== account.hash){ errEl.textContent = "Invalid Employee ID or password."; return; }
 
   const role = computeRole(idLower);
@@ -3715,7 +3884,17 @@ async function adminResetPassword(eeCode){
   renderAdminEmployees();
   if (document.getElementById("userMgmtTable")) renderAdminUserManagement(document.getElementById("userMgmtSearch").value);
   if (document.getElementById("auditTable")) renderAdminAuditLog();
-  infoModal("Password Reset", "Password reset successfully. User must login using Employee ID as temporary password and change password immediately.", "OK");
+  if (emp.email){
+    sendNotificationWebhook("password_reset_by_admin", {
+      eeCode: emp.eeCode,
+      employeeName: emp.name,
+      employeeEmail: emp.email,
+      adminName: currentUser.name
+    });
+    infoModal("Password Reset", "Password reset successfully, and a notification has been sent to " + escapeHtml(emp.name) + " (" + escapeHtml(emp.email) + "). User must login using Employee ID as temporary password and change password immediately.", "OK");
+  } else {
+    infoModal("Password Reset", "Password reset successfully. <strong>No email on file for " + escapeHtml(emp.name) + "</strong> - please notify them manually. User must login using Employee ID as temporary password and change password immediately.", "OK");
+  }
 }
 
 function getLastLogin(idLower){
@@ -3782,13 +3961,34 @@ function wireAuthEvents(){
   });
   document.getElementById("forgotPasswordLink").addEventListener("click", function(e){
     e.preventDefault();
-    infoModal(
-      "Forgot Password?",
-      "Please contact HR Admin or your Function Admin to reset your password.<br><br>" +
-      "After reset, your default password will be your Employee ID.<br><br>" +
-      "<strong>Example:</strong><br>Employee ID: VL-625<br>Temporary Password: VL-625",
-      "Got it"
-    );
+    const typedId = (document.getElementById("loginUserId").value || "").trim();
+    if (typedId){
+      const idLower = typedId.toLowerCase();
+      const isAdminId = idLower === ADMIN_ACCOUNT_ID;
+      const emp = isAdminId ? null : DB.employees.find(function(x){ return x.eeCode.toLowerCase() === idLower; });
+      sendNotificationWebhook("forgot_password_request", {
+        attemptedId: typedId,
+        employeeName: emp ? emp.name : (isAdminId ? "Administrator" : "(Employee ID not recognized)"),
+        employeeEmail: emp ? (emp.email || "") : ""
+      });
+      logAudit(typedId, "Forgot Password requested (notification sent to admin)");
+      infoModal(
+        "Forgot Password?",
+        "A request has been sent to the Admin notifying them that <strong>" + escapeHtml(typedId) + "</strong> needs a password reset.<br><br>" +
+        "If this is urgent, please also contact HR Admin or your Function Admin directly.<br><br>" +
+        "After reset, your default password will be your Employee ID.",
+        "Got it"
+      );
+    } else {
+      infoModal(
+        "Forgot Password?",
+        "Please type your Employee ID into the field above first, then click \"Forgot Password?\" again - this lets us notify the Admin who needs help.<br><br>" +
+        "Alternatively, contact HR Admin or your Function Admin directly.<br><br>" +
+        "After reset, your default password will be your Employee ID.<br><br>" +
+        "<strong>Example:</strong><br>Employee ID: VL-625<br>Temporary Password: VL-625",
+        "Got it"
+      );
+    }
   });
   document.getElementById("pwChangeSubmitBtn").addEventListener("click", submitPasswordChange);
   ["pwCurrent","pwNew","pwConfirm"].forEach(function(id){
@@ -3809,6 +4009,7 @@ function wireAuthEvents(){
 
 
 document.addEventListener("DOMContentLoaded", function(){
+  runStorageDiagnostics();
   loadActiveMasterData();
   currentCycle = getCycles().indexOf(2026) !== -1 ? 2026 : getCycles()[0];
   renderCycleSelect();
